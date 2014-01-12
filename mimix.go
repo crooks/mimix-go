@@ -387,7 +387,27 @@ func EncryptMessage(msg []byte) (packet []byte) {
 				fmt.Println("Encrypted payload length != 10240")
 			}
 			innerHeader.packetInfo = IntermediateEncode(packetInfo)
+			// At this point, the new intermediate header it built (but not yet
+			// inserted into the packet).  All the other existing headers now need
+			// to be wrapped with a layer of encryption.
+			for h2 := 0; h2 < h; h2++ {
+				// Each 16 byte IV is extracted from the randomly generated 144 Byte
+				// Packet Info IVs.
+				ivStart := h2 * 16
+				ivEnd := ivStart + 16
+				iv := packetInfo.ivs[ivStart:ivEnd]
+				headerStart := h2 * 1024
+				headerEnd := headerStart + 1024
+				// Make a new slice referencing the correct Bytes within the packet
+				headerSlice := packet[headerStart:headerEnd]
+				// Another slice is required to accommodate the encrypted header,
+				// prior to copying it into the packet.
+				headerEnc := make([]byte, len(headerSlice))
+				EncryptAESCFB(headerEnc, headerSlice, innerHeader.aesKey, iv)
+				copy(headerEnc, headerSlice)
+			}
 		}
+		// Write the new header into the compiled packet.
 		packet = append(OuterEncode(InnerEncode(innerHeader)), packet...)
 		expectedLength = (h + 1) * 1024
 		actualLength = len(packet)
@@ -396,8 +416,13 @@ func EncryptMessage(msg []byte) (packet []byte) {
 				expectedLength, actualLength)
 		}
 	}
+	// The header component of the packet must always be 10240 Bytes (10 headers
+	// of 1024 Bytes each).  We've already validated the packet length as being
+	// the correct multiple of the number of headers generated so it's safe here
+	// to just append random bytes.
 	padding := 10240 - len(packet)
 	packet = append(packet, randbytes(padding)...)
+	// Finally, append the payload which is already padded to 10240 Bytes.
 	packet = append(packet, payload...)
 	if len(packet) != 20480 {
 		fmt.Println("Incorrect total packet length.")
