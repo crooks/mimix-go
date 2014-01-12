@@ -1,11 +1,11 @@
 // vim: tabstop=2 shiftwidth=2
 
-// A mimix packet encoder/decoder
+// Mimis - A Mixmaster-like packet encoder
 package main
 
 import (
 		"crypto/rand"
-		//"crypto/sha256"
+		"crypto/sha256"
 		"crypto/sha512"
 		"fmt"
 		"encoding/binary"
@@ -20,7 +20,7 @@ import (
 // ivs slice.
 type intermediate struct {
 	ivs []byte // 144 Bytes (9 * 16)
-	next_hop string // 80 Bytes
+	nextHop string // 80 Bytes
 	antiTag []byte // 32 Bytes (SHA256)
 	// Total size: 256 Bytes
 }
@@ -34,6 +34,7 @@ type exit struct {
 	messageid []byte // 16 Bytes
 	iv []byte // 16 Bytes
 	exitType uint8 // Byte
+	payloadLength uint16 // 2 Bytes
 	payloadHash []byte // 32 Bytes (SHA256)
 }
 
@@ -47,16 +48,22 @@ type inner struct {
 	timestamp uint32 // 4 Bytes
 }
 
-// outer contains the encrypted inner struct (in byte format) along with the
-// info required to enable the recipient to decrypt it.  An AES key is
-// encrypted with the recipient's Public RSA key and the corresponding IV is
-// passed in plain text.  This key/iv conbination is required to decrypt the
-// inner component.
-type outer struct {
-	publicKeyid []byte //16 Bytes
-	inner []byte // 384 Bytes
-}
+// ExitEncode takes an exit type struct and outputs it as a byte slice.  This
+// becomes a component of the inner header.  It contains loads of padding as
+// the output needs to correspond exactly with the intermediate type component;
+// The two being interchangable within the inner header.
 
+/* Header Format:-
+Description										Bytes				Position
+Chunk number                 1 byte       0
+Number of chunks             1 byte       1
+Message ID                  16 bytes      2-17
+Initialization vector       16 bytes      18-33
+Exit type                    1 byte       34
+Payload Length               2 bytes      35-36
+Payload digest              32 bytes      37-68
+Padding                    187 bytes      69-255
+*/
 func ExitEncode(e exit) []byte {
 	buf := new(bytes.Buffer)
 	buf.WriteByte(byte(e.chunknum))
@@ -64,14 +71,17 @@ func ExitEncode(e exit) []byte {
 	buf.Write(e.messageid)
 	buf.Write(e.iv)
 	buf.WriteByte(byte(e.exitType))
+	buf.Write(encode_uint16(e.payloadLength))
 	buf.Write(e.payloadHash)
-	buf.Write(randbytes(189))
+	buf.Write(randbytes(187))
 	if buf.Len() != 256 {
-		fmt.Println("Error: Incorrect exit length")
+		fmt.Printf("Error: Incorrect exit length: %d\n", buf.Len())
 	}
 	return buf.Bytes()
 }
 
+// ExitDecode reverses the action of ExitEncode.  The output is an exit-type struct
+// containing the exit header components.
 func ExitDecode(b []byte) exit {
 	if len(b) != 256 {
 		fmt.Println("Error: Incorrect byte count to expand exit")
@@ -82,18 +92,27 @@ func ExitDecode(b []byte) exit {
 	e.messageid = b[2:18]
 	e.iv = b[18:34]
 	e.exitType = b[34]
-	e.payloadHash = b[35:67]
+	e.payloadLength = decode_uint16(b[35:37])
+	e.payloadHash = b[37:69]
 	return e
 }
 
+// IntermediateEncode takes an intermediate type struct and outputs it as a
+// byte slice.
 
+/* Header Format:-
+Description										Bytes				Position
+9 Initialization vectors      144 bytes   0-143
+Next address                   80 bytes   144-223
+Anti-tag digest                32 bytes   224-255
+*/
 func IntermediateEncode(i intermediate) []byte {
 	if len(i.ivs) != 144 {
 		fmt.Println("Error: Incorrect IV Bytes")
 	}
 	buf := new(bytes.Buffer)
 	buf.Write(i.ivs)
-	buf.WriteString(padstring(i.next_hop, 80))
+	buf.WriteString(padstring(i.nextHop, 80))
 	buf.Write(i.antiTag)
 	if buf.Len() != 256 {
 		fmt.Println("Error: Incorrect intermediate length")
@@ -101,17 +120,41 @@ func IntermediateEncode(i intermediate) []byte {
 	return buf.Bytes()
 }
 
+// IntermediateDecode reverses the actions of IntermedateEncode.  It outputs an
+// intermediate type struct containing the associated header components.
 func IntermediateDecode(b []byte) intermediate {
 	if len(b) != 256 {
 		fmt.Println("Error: Incorrect byte count to expand intermediate")
 	}
 	i := intermediate{}
 	i.ivs = b[:144]
-	i.next_hop = strings.TrimRight(string(b[144:224]), "\x00")
+	i.nextHop = strings.TrimRight(string(b[144:224]), "\x00")
 	return i
 }
 
+// InnerEncode compiles the mimix inner header that will become the encrypted
+// element of the complete 1024 byte header.
+
+/* Header Format:-
+Description										Bytes				Position
+Packet ID                     16 bytes    0-15
+AES key                       32 bytes    16-47
+Packet type identifier         1 byte     48    (0 = intermediate, 1 = exit)
+Packet Info                  256 bytes    49-304
+Timestamp                      2 bytes    321-322
+Padding                       13 bytes    323-335
+Message digest                64 bytes    336-383
+*/
 func InnerEncode(i inner) []byte {
+	if len(i.aesKey) != 32 {
+		fmt.Println("Incorrect inner aeskey length")
+	}
+	if i.packetType != 0  && i.packetType != 1 {
+		fmt.Println("Invalid packet type")
+	}
+	if len(i.packetInfo) != 256 {
+		fmt.Println("Invalid Packet Info length")
+	}
 	buf := new(bytes.Buffer)
 	buf.Write(randbytes(16)) // Packet ID
 	buf.Write(i.aesKey)
@@ -149,16 +192,33 @@ func InnerDecode(b []byte) (i inner) {
 	return
 }
 
-func OuterEncode (o outer) []byte {
+// OuterEncode takes the inner header (as a byte slice) and encrypts it using
+// an internally-generated AES256 key and IV.  The key is then RSA encrypted
+// using the Public Key for the next-hop recipient and the AES key is
+// discarded.  The IV is retained unencrypted within the output packet.
+
+/* Header Format:-
+Description										Bytes				Position
+Public KeyID									16 bytes		0-15
+Length of RSA-encrypted data   2 bytes		16-17
+RSA-encrypted session key    512 bytes		18-530
+Initialization vector         16 bytes		530-545
+Encrypted header part        384 bytes 		546-929
+Padding                       30 bytes		930-959
+Message digest                64 bytes		960-1023
+*/
+func OuterEncode (innerHeader []byte) []byte {
 	buf := new(bytes.Buffer)
-	buf.Write(o.publicKeyid)
+	// Write a fake keyid until we implement proper RSA key management
+	publicKeyid := []byte("0123456789012345")
+	buf.Write(publicKeyid)
 	// This AES key and IV are used (and only used) to encrypt the inner packet
 	// header.
 	aeskey := randbytes(32)
 	aesiv := randbytes(16)
 	// Encrypt the inner block using AES256
-	aesEncrypted := make([]byte, len(o.inner))
-	EncryptAESCFB(aesEncrypted, o.inner, aeskey, aesiv)
+	aesEncrypted := make([]byte, 384)
+	EncryptAESCFB(aesEncrypted, innerHeader, aeskey, aesiv)
 	// Encrypt the AES key with RSA(OAEP)
 	rsaData := encrypt(aeskey)
 	rsaDataLen := len(rsaData)
@@ -184,27 +244,32 @@ func OuterEncode (o outer) []byte {
 	return buf.Bytes()
 }
 
-func OuterDecode (b []byte) (o outer) {
-	if len(b) != 1024 {
-		fmt.Println("Error: Incorrect byte count to expand outer")
+// OuterDecode, unlike other decode functions returns a byte array instead of a
+// struct.  The sole output of the function is the decrypted inner header.  The
+// other components of the header are only required within this function to
+// perform the integrity check and decryption.
+func OuterDecode (outer []byte) (plain []byte) {
+	if len(outer) != 1024 {
+		fmt.Println("Error: Incorrect byte count to decode inner header")
 	}
 	check := sha512.New()
-	check.Write(b[:960])
-	hash := b[960:]
+	check.Write(outer[:960])
+	hash := outer[960:]
 	if ! bytes.Equal(check.Sum(nil), hash) {
 		fmt.Println("Error: Outer checksum failed")
 	}
-	o.publicKeyid = b[:16]
-	rsaDataLen := decode_uint16(b[16:18])
+	//The public key is required in order to know which RSA key to use for
+	//decryption.  At the moment this isn't implemented.
+	//publicKeyid := outer[:16]
+	rsaDataLen := decode_uint16(outer[16:18])
 	fmt.Println("lenRSA:", rsaDataLen)
 	keyend := 18 + rsaDataLen
-	rsaData := b[18:keyend]
+	rsaData := outer[18:keyend]
 	aeskey := decrypt(rsaData)
-	aesiv := b[530:546]
+	aesiv := outer[530:546]
 	// Need a slice of the correct size to receive the decrypted inner
-	plain := make([]byte, 384)
-	DecryptAESCFB(plain, b[546:930], aeskey, aesiv)
-	o.inner = plain
+	plain = make([]byte, 384)
+	DecryptAESCFB(plain, outer[546:930], aeskey, aesiv)
 	return
 }
 
@@ -265,40 +330,83 @@ func decode_uint32(b []byte) (i uint32) {
 	return
 }
 
-func main() {
-	/*
-	var i = intermediate{}
-	i.ivs = randbytes(144)
-	i.next_hop = "http://foo.bar.org"
-	i.antiTag = randbytes(32)
-	encoded := IntermediateEncode(i)
-	decoded := IntermediateDecode(encoded)
-	*/
-
-	var e = exit{}
-	e.chunknum = 100
-	e.numchunks = 1
-	e.messageid = randbytes(16)
-	e.iv = randbytes(16)
-	e.exitType = 0
-	e.payloadHash = randbytes(32)
-
-	var in = inner{}
-	in.aesKey = randbytes(32)
-	in.packetType = 1
-	in.packetInfo = ExitEncode(e) // Insert Exit headers
-
-	var out = outer{}
-	out.publicKeyid = []byte("0123456789012345")
-	out.inner = InnerEncode(in) // Insert Inner
-	encout := OuterEncode(out)
-	newout := OuterDecode(encout)
-	newin := InnerDecode(newout.inner)
-	if bytes.Equal(in.aesKey, newin.aesKey) {
-		fmt.Println("Match")
-	} else {
-		fmt.Println("Broken")
+func EncryptPayload(msgPlain, aeskey, aesiv []byte) ([]byte, uint16) {
+	msgEnc := make([]byte, len(msgPlain))
+	EncryptAESCFB(msgEnc, msgPlain, aeskey, aesiv)
+	buf := new(bytes.Buffer)
+	buf.Write(msgEnc)
+	msgLen := len(msgEnc)
+	if msgLen < 10240 {
+		buf.Write(randbytes(10240 - msgLen))
 	}
-	newe := ExitDecode(newin.packetInfo)
-	fmt.Println(newe.chunknum)
+	return buf.Bytes(), uint16(msgLen)
+}
+
+
+func EncryptMessage(msg []byte) (packet []byte) {
+	// Define message ID early as it remains consistent across all message
+	// chunks.
+	messageid := randbytes(16)
+	packet = make([]byte, 0, 20480)
+	var packetType uint8 = 1
+	var payload []byte
+	var payloadLen uint16
+	var actualLength, expectedLength int
+	for h := 0; h < 2; h++ {
+		var innerHeader = inner{}
+		innerHeader.aesKey = randbytes(32)
+		innerHeader.packetType = packetType
+		if packetType == 1 {
+			var packetInfo = exit{}
+			packetInfo.chunknum = 1
+			packetInfo.numchunks = 1
+			packetInfo.messageid = messageid
+			packetInfo.iv = randbytes(16)
+			packetInfo.exitType = 0
+			payload, payloadLen = EncryptPayload(msg, innerHeader.aesKey, packetInfo.iv)
+			packetInfo.payloadLength = payloadLen
+			if payloadLen != uint16(len(msg)) {
+				fmt.Println("Encrypted payload length != plain message length")
+			}
+			hash := sha256.New()
+			hash.Write(msg)
+			packetInfo.payloadHash = hash.Sum(nil)
+			innerHeader.packetInfo = ExitEncode(packetInfo)
+			// There is only ever a single exit header.  All proceeding headers need to
+			// be Type 0 (Intermediate).
+			packetType = 0
+		} else if packetType == 0 {
+			var packetInfo = intermediate{}
+			packetInfo.ivs = randbytes(144)
+			// The next two are currently fake.
+			packetInfo.nextHop = "http://foo.bar.org"
+			packetInfo.antiTag = randbytes(32)
+			payloadiv := packetInfo.ivs[128:144]
+			payload, payloadLen = EncryptPayload(payload, innerHeader.aesKey, payloadiv)
+			if payloadLen != 10240 {
+				fmt.Println("Encrypted payload length != 10240")
+			}
+			innerHeader.packetInfo = IntermediateEncode(packetInfo)
+		}
+		packet = append(OuterEncode(InnerEncode(innerHeader)), packet...)
+		expectedLength = (h + 1) * 1024
+		actualLength = len(packet)
+		if actualLength != expectedLength {
+			fmt.Printf("Incorrect packet length. Expected %d, got %d",
+				expectedLength, actualLength)
+		}
+	}
+	padding := 10240 - len(packet)
+	packet = append(packet, randbytes(padding)...)
+	packet = append(packet, payload...)
+	if len(packet) != 20480 {
+		fmt.Println("Incorrect total packet length.")
+	}
+	return
+}
+
+
+func main() {
+	msg := []byte("This is a test message")
+	fmt.Println(len(EncryptMessage(msg)))
 }
